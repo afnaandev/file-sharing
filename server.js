@@ -1,7 +1,7 @@
 // Minimal WebRTC signaling server.
 // It never sees file contents — it only relays small JSON messages
 // (SDP offers/answers and ICE candidates) between two browsers
-// so they can establish a direct peer-to-peer connection.
+// so they can establish a direct peer-to-peer connection. 
 
 const { WebSocketServer } = require('ws');
 const http = require('http');

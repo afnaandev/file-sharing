@@ -5,12 +5,34 @@
 
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 8080;
+const PUBLIC_DIR = path.join(__dirname, 'public');
 
+const MIME_TYPES = {
+  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
+  '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+};
+
+// This server now does two jobs: serves the static client page (public/index.html)
+// AND handles the WebSocket signaling — so you deploy ONE service and get ONE URL.
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('P2P file share signaling server is running.\n');
+  let filePath = req.url === '/' ? '/index.html' : req.url;
+  filePath = path.join(PUBLIC_DIR, path.normalize(filePath).replace(/^(\.\.[\/\\])+/, ''));
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
+      return;
+    }
+    const ext = path.extname(filePath);
+    res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
+    res.end(data);
+  });
 });
 
 const wss = new WebSocketServer({ server });

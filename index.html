@@ -80,9 +80,10 @@
 
 <script>
 // ---- Config ----
-// Change this to wherever you deploy server.js (must be wss:// in production/https pages)
-const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host.replace(/:\d+$/, '') + ':8080';
-// If you host the client separately from the server, hardcode it instead, e.g.:
+// The server serves this page AND handles signaling on the same host/port,
+// so we just reuse whatever origin the page was loaded from.
+const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+// If you ever split them onto different hosts, hardcode the signaling one instead, e.g.:
 // const SIGNALING_URL = 'wss://your-signaling-server.example.com';
 
 const ICE_SERVERS = [

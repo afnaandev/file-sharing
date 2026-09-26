@@ -1,7 +1,7 @@
 // Minimal WebRTC signaling server.
 // It never sees file contents — it only relays small JSON messages
 // (SDP offers/answers and ICE candidates) between two browsers
-// so they can establish a direct peer-to-peer connection. 
+// so they can establish a direct peer-to-peer connection.
 
 const { WebSocketServer } = require('ws');
 const http = require('http');
@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 8080;
-const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_DIR = __dirname; // index.html lives right next to server.js, no public/ subfolder
 
 const MIME_TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',

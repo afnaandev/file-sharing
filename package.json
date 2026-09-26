@@ -1,0 +1,12 @@
+{
+  "name": "p2p-file-share",
+  "version": "1.0.0",
+  "description": "Browser-to-browser P2P file transfer using WebRTC, with a lightweight WebSocket signaling server.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>P2P File Share</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2e38;
+    --text: #e8eaed; --muted: #9aa0aa; --accent: #4f8cff; --accent-dim: #2c4a85;
+    --ok: #3ecf8e; --warn: #e6a23c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 32px; width: 100%; max-width: 520px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .room-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  input[type=text] {
+    flex: 1; background: #0f1218; border: 1px solid var(--border); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 14px;
+  }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 10px 16px; font-size: 14px; cursor: pointer; font-weight: 600;
+  }
+  button.secondary { background: var(--accent-dim); }
+  button:disabled { background: #333743; cursor: not-allowed; color: var(--muted); }
+  .status {
+    font-size: 13px; color: var(--muted); margin: 12px 0; padding: 10px 12px;
+    background: #0f1218; border-radius: 8px; border: 1px solid var(--border);
+  }
+  .status.connected { color: var(--ok); }
+  .drop {
+    border: 2px dashed var(--border); border-radius: 10px; padding: 28px;
+    text-align: center; color: var(--muted); margin-top: 16px; cursor: pointer;
+    transition: border-color .15s;
+  }
+  .drop.drag { border-color: var(--accent); color: var(--text); }
+  .drop.disabled { opacity: 0.4; cursor: not-allowed; }
+  #fileInput { display: none; }
+  .transfer {
+    margin-top: 14px; background: #0f1218; border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px;
+  }
+  .transfer .name { font-size: 13px; margin-bottom: 6px; word-break: break-all; }
+  .bar-bg { background: #23262f; border-radius: 6px; height: 8px; overflow: hidden; }
+  .bar-fg { background: var(--accent); height: 100%; width: 0%; transition: width .1s; }
+  .transfer .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  a.dl { color: var(--ok); font-size: 12px; text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>P2P File Share</h1>
+  <div class="sub">Files transfer directly between browsers. Nothing is uploaded to a server.</div>
+
+  <div class="room-row">
+    <input id="roomInput" type="text" placeholder="Room code (share this with the other PC)" />
+    <button id="genBtn" class="secondary">Generate</button>
+  </div>
+  <button id="joinBtn" style="width:100%;">Connect</button>
+
+  <div id="status" class="status">Not connected.</div>
+
+  <div id="drop" class="drop disabled">
+    Connect first, then drag files here (or click to choose)
+    <input id="fileInput" type="file" multiple />
+  </div>
+
+  <div id="transfers"></div>
+</div>
+
+<script>
+// ---- Config ----
+// Change this to wherever you deploy server.js (must be wss:// in production/https pages)
+const SIGNALING_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host.replace(/:\d+$/, '') + ':8080';
+// If you host the client separately from the server, hardcode it instead, e.g.:
+// const SIGNALING_URL = 'wss://your-signaling-server.example.com';
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  // For networks with strict NAT/firewalls, STUN alone isn't enough — add a TURN
+  // server here (e.g. from Twilio, Cloudflare, or your own coturn instance):
+  // { urls: 'turn:your-turn-server:3478', username: 'user', credential: 'pass' },
+];
+
+const CHUNK_SIZE = 64 * 1024; // 64KB chunks
+
+let ws, pc, dataChannel, isInitiator = false;
+const sendQueue = [];
+let incomingFile = null;
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status'), dropEl = $('drop'), fileInput = $('fileInput'), transfersEl = $('transfers');
+
+function setStatus(text, connected = false) {
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (connected ? ' connected' : '');
+}
+
+$('genBtn').onclick = () => {
+  $('roomInput').value = Math.random().toString(36).slice(2, 8).toUpperCase();
+};
+
+$('joinBtn').onclick = () => {
+  const room = $('roomInput').value.trim();
+  if (!room) { alert('Enter or generate a room code first.'); return; }
+  connect(room);
+};
+
+function connect(room) {
+  setStatus('Connecting to signaling server...');
+  ws = new WebSocket(SIGNALING_URL);
+
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room }));
+
+  ws.onerror = () => setStatus('Could not reach signaling server. Check SIGNALING_URL / that server.js is running.');
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'joined') {
+      isInitiator = msg.initiator;
+      setStatus(`In room. Waiting for the other PC to join...`);
+    }
+
+    if (msg.type === 'room-full') {
+      setStatus('That room already has two peers. Try a different code.');
+      ws.close();
+    }
+
+    if (msg.type === 'ready') {
+      setStatus('Peer found. Establishing direct connection...');
+      setupPeerConnection();
+      if (isInitiator) {
+        dataChannel = pc.createDataChannel('file-transfer');
+        setupDataChannel();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+      }
+    }
+
+    if (msg.type === 'offer') {
+      await pc.setRemoteDescription(msg.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
+    }
+
+    if (msg.type === 'answer') {
+      await pc.setRemoteDescription(msg.sdp);
+    }
+
+    if (msg.type === 'ice-candidate') {
+      try { await pc.addIceCandidate(msg.candidate); } catch (e) { /* ignore */ }
+    }
+
+    if (msg.type === 'peer-left') {
+      setStatus('The other peer disconnected.');
+      dropEl.classList.add('disabled');
+    }
+  };
+}
+
+function setupPeerConnection() {
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') {
+      setStatus('Connected directly to peer (P2P). Ready to send files.', true);
+      dropEl.classList.remove('disabled');
+    }
+    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+      setStatus('Connection lost.');
+      dropEl.classList.add('disabled');
+    }
+  };
+
+  pc.ondatachannel = (e) => {
+    dataChannel = e.channel;
+    setupDataChannel();
+  };
+}
+
+function setupDataChannel() {
+  dataChannel.binaryType = 'arraybuffer';
+
+  dataChannel.onopen = () => {
+    setStatus('Connected directly to peer (P2P). Ready to send files.', true);
+    dropEl.classList.remove('disabled');
+  };
+
+  dataChannel.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      const meta = JSON.parse(event.data);
+      if (meta.type === 'file-start') {
+        incomingFile = {
+          name: meta.name, size: meta.size, mime: meta.mime,
+          received: 0, chunks: [],
+          row: addTransferRow(meta.name, meta.size, 'Receiving'),
+        };
+      }
+      if (meta.type === 'file-end' && incomingFile) {
+        const blob = new Blob(incomingFile.chunks, { type: incomingFile.mime || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const { bar, metaEl } = incomingFile.row;
+        bar.style.width = '100%';
+        metaEl.innerHTML = `Done — <a class="dl" href="${url}" download="${incomingFile.name}">Download ${incomingFile.name}</a>`;
+        incomingFile = null;
+      }
+    } else {
+      if (!incomingFile) return;
+      incomingFile.chunks.push(event.data);
+      incomingFile.received += event.data.byteLength;
+      const pct = Math.min(100, Math.round((incomingFile.received / incomingFile.size) * 100));
+      incomingFile.row.bar.style.width = pct + '%';
+      incomingFile.row.metaEl.textContent = `${pct}% received`;
+    }
+  };
+}
+
+function addTransferRow(name, size, label) {
+  const div = document.createElement('div');
+  div.className = 'transfer';
+  div.innerHTML = `
+    <div class="name">${name} (${formatBytes(size)})</div>
+    <div class="bar-bg"><div class="bar-fg"></div></div>
+    <div class="meta">${label}...</div>
+  `;
+  transfersEl.prepend(div);
+  return { bar: div.querySelector('.bar-fg'), metaEl: div.querySelector('.meta') };
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function sendFile(file) {
+  if (!dataChannel || dataChannel.readyState !== 'open') {
+    alert('Not connected to a peer yet.');
+    return;
+  }
+  const row = addTransferRow(file.name, file.size, 'Sending');
+  dataChannel.send(JSON.stringify({ type: 'file-start', name: file.name, size: file.size, mime: file.type }));
+
+  let offset = 0;
+  const buffer = await file.arrayBuffer();
+
+  function sendNextChunk() {
+    if (offset >= buffer.byteLength) {
+      dataChannel.send(JSON.stringify({ type: 'file-end' }));
+      row.bar.style.width = '100%';
+      row.metaEl.textContent = 'Sent';
+      return;
+    }
+    // Backpressure: wait if the channel's send buffer is getting full
+    if (dataChannel.bufferedAmount > 8 * CHUNK_SIZE) {
+      setTimeout(sendNextChunk, 20);
+      return;
+    }
+    const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+    dataChannel.send(chunk);
+    offset += chunk.byteLength;
+    const pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
+    row.bar.style.width = pct + '%';
+    row.metaEl.textContent = `${pct}% sent`;
+    setTimeout(sendNextChunk, 0);
+  }
+  sendNextChunk();
+}
+
+// Drag & drop + click-to-choose
+dropEl.addEventListener('click', () => { if (!dropEl.classList.contains('disabled')) fileInput.click(); });
+fileInput.addEventListener('change', () => { [...fileInput.files].forEach(sendFile); fileInput.value = ''; });
+
+['dragover', 'dragenter'].forEach(evt => dropEl.addEventListener(evt, (e) => {
+  e.preventDefault();
+  if (!dropEl.classList.contains('disabled')) dropEl.classList.add('drag');
+}));
+['dragleave', 'drop'].forEach(evt => dropEl.addEventListener(evt, (e) => {
+  e.preventDefault();
+  dropEl.classList.remove('drag');
+}));
+dropEl.addEventListener('drop', (e) => {
+  if (dropEl.classList.contains('disabled')) return;
+  [...e.dataTransfer.files].forEach(sendFile);
+});
+</script>
+</body>
+</html>

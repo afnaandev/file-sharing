@@ -94,7 +94,9 @@ const ICE_SERVERS = [
   // { urls: 'turn:your-turn-server:3478', username: 'user', credential: 'pass' },
 ];
 
-const CHUNK_SIZE = 64 * 1024; // 64KB chunks
+const CHUNK_SIZE = 256 * 1024; // 256KB — larger chunks = fewer messages = less overhead
+const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024; // 1MB
+const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // pause sending above this, resume once drained
 
 let ws, pc, dataChannel, isInitiator = false;
 const sendQueue = [];
@@ -259,31 +261,42 @@ async function sendFile(file) {
   }
   const row = addTransferRow(file.name, file.size, 'Sending');
   dataChannel.send(JSON.stringify({ type: 'file-start', name: file.name, size: file.size, mime: file.type }));
+  dataChannel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
+  const startTime = performance.now();
   let offset = 0;
   const buffer = await file.arrayBuffer();
 
-  function sendNextChunk() {
-    if (offset >= buffer.byteLength) {
-      dataChannel.send(JSON.stringify({ type: 'file-end' }));
-      row.bar.style.width = '100%';
-      row.metaEl.textContent = 'Sent';
-      return;
+  await new Promise((resolve) => {
+    function sendChunks() {
+      // Send as fast as possible with no artificial delay — only stop
+      // when the channel's own send buffer is genuinely backed up.
+      while (offset < buffer.byteLength) {
+        if (dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+          dataChannel.onbufferedamountlow = () => {
+            dataChannel.onbufferedamountlow = null;
+            sendChunks();
+          };
+          return;
+        }
+        const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+        dataChannel.send(chunk);
+        offset += chunk.byteLength;
+
+        const pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
+        const elapsed = (performance.now() - startTime) / 1000;
+        const speed = elapsed > 0 ? (offset / elapsed / (1024 * 1024)).toFixed(1) : '0';
+        row.bar.style.width = pct + '%';
+        row.metaEl.textContent = `${pct}% sent — ${speed} MB/s`;
+      }
+      resolve();
     }
-    // Backpressure: wait if the channel's send buffer is getting full
-    if (dataChannel.bufferedAmount > 8 * CHUNK_SIZE) {
-      setTimeout(sendNextChunk, 20);
-      return;
-    }
-    const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-    dataChannel.send(chunk);
-    offset += chunk.byteLength;
-    const pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
-    row.bar.style.width = pct + '%';
-    row.metaEl.textContent = `${pct}% sent`;
-    setTimeout(sendNextChunk, 0);
-  }
-  sendNextChunk();
+    sendChunks();
+  });
+
+  dataChannel.send(JSON.stringify({ type: 'file-end' }));
+  row.bar.style.width = '100%';
+  row.metaEl.textContent = 'Sent';
 }
 
 // Drag & drop + click-to-choose

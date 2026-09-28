@@ -218,11 +218,7 @@ function setupDataChannel() {
         };
       }
       if (meta.type === 'file-end' && incomingFile) {
-        const blob = new Blob(incomingFile.chunks, { type: incomingFile.mime || 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const { bar, metaEl } = incomingFile.row;
-        bar.style.width = '100%';
-        metaEl.innerHTML = `Done — <a class="dl" href="${url}" download="${incomingFile.name}">Download ${incomingFile.name}</a>`;
+        finishIncoming(incomingFile, meta.sha256);
         incomingFile = null;
       }
     } else {
@@ -234,6 +230,36 @@ function setupDataChannel() {
       incomingFile.row.metaEl.textContent = `${pct}% received`;
     }
   };
+}
+
+async function sha256(buf) {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Verify the file arrived complete and unchanged before offering the download.
+async function finishIncoming(f, expectedHash) {
+  const { bar, metaEl } = f.row;
+  if (f.received !== f.size) {
+    metaEl.textContent = `Transfer incomplete: got ${f.received} of ${f.size} bytes. Please resend.`;
+    return;
+  }
+  const blob = new Blob(f.chunks, { type: f.mime || 'application/octet-stream' });
+  if (expectedHash && crypto.subtle) {
+    const actual = await sha256(await blob.arrayBuffer());
+    if (actual !== expectedHash) {
+      metaEl.textContent = 'File corrupted in transit (checksum mismatch). Please resend.';
+      return;
+    }
+  }
+  bar.style.width = '100%';
+  const a = document.createElement('a');
+  a.className = 'dl';
+  a.href = URL.createObjectURL(blob);
+  a.download = f.name;
+  a.textContent = 'Download ' + f.name;
+  metaEl.textContent = 'Done and verified. ';
+  metaEl.appendChild(a);
 }
 
 function addTransferRow(name, size, label) {
@@ -254,6 +280,12 @@ function formatBytes(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+// Files are sent strictly one after another so chunks from different files never interleave.
+let sendChain = Promise.resolve();
+function enqueueFiles(files) {
+  for (const f of files) sendChain = sendChain.then(() => sendFile(f)).catch(console.error);
+}
+
 async function sendFile(file) {
   if (!dataChannel || dataChannel.readyState !== 'open') {
     alert('Not connected to a peer yet.');
@@ -263,9 +295,11 @@ async function sendFile(file) {
   dataChannel.send(JSON.stringify({ type: 'file-start', name: file.name, size: file.size, mime: file.type }));
   dataChannel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
+  const chunkSize = Math.min(CHUNK_SIZE, (pc.sctp && pc.sctp.maxMessageSize) || CHUNK_SIZE);
   const startTime = performance.now();
   let offset = 0;
   const buffer = await file.arrayBuffer();
+  const hash = crypto.subtle ? await sha256(buffer) : null;
 
   await new Promise((resolve) => {
     function sendChunks() {
@@ -279,7 +313,7 @@ async function sendFile(file) {
           };
           return;
         }
-        const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+        const chunk = buffer.slice(offset, offset + chunkSize);
         dataChannel.send(chunk);
         offset += chunk.byteLength;
 
@@ -294,14 +328,14 @@ async function sendFile(file) {
     sendChunks();
   });
 
-  dataChannel.send(JSON.stringify({ type: 'file-end' }));
+  dataChannel.send(JSON.stringify({ type: 'file-end', sha256: hash }));
   row.bar.style.width = '100%';
   row.metaEl.textContent = 'Sent';
 }
 
 // Drag & drop + click-to-choose
 dropEl.addEventListener('click', () => { if (!dropEl.classList.contains('disabled')) fileInput.click(); });
-fileInput.addEventListener('change', () => { [...fileInput.files].forEach(sendFile); fileInput.value = ''; });
+fileInput.addEventListener('change', () => { enqueueFiles([...fileInput.files]); fileInput.value = ''; });
 
 ['dragover', 'dragenter'].forEach(evt => dropEl.addEventListener(evt, (e) => {
   e.preventDefault();
@@ -313,7 +347,7 @@ fileInput.addEventListener('change', () => { [...fileInput.files].forEach(sendFi
 }));
 dropEl.addEventListener('drop', (e) => {
   if (dropEl.classList.contains('disabled')) return;
-  [...e.dataTransfer.files].forEach(sendFile);
+  enqueueFiles([...e.dataTransfer.files]);
 });
 </script>
 </body>

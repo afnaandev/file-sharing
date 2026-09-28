@@ -120,83 +120,141 @@ $('joinBtn').onclick = () => {
   connect(room);
 };
 
+let pendingCandidates = [];
+
+// Tear down everything from the previous session so nothing stale can
+// fire events into the next one.
+function cleanup() {
+  if (dataChannel) {
+    dataChannel.onopen = dataChannel.onmessage = dataChannel.onclose = null;
+    try { dataChannel.close(); } catch (e) {}
+    dataChannel = null;
+  }
+  if (pc) {
+    pc.onicecandidate = pc.onconnectionstatechange = pc.ondatachannel = null;
+    try { pc.close(); } catch (e) {}
+    pc = null;
+  }
+  if (ws) {
+    ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+    try { ws.close(); } catch (e) {}
+    ws = null;
+  }
+  pendingCandidates = [];
+  incomingFile = null;
+  dropEl.classList.add('disabled');
+}
+
+async function flushCandidates(conn) {
+  const queued = pendingCandidates;
+  pendingCandidates = [];
+  for (const c of queued) {
+    try { await conn.addIceCandidate(c); } catch (e) { /* ignore */ }
+  }
+}
+
 function connect(room) {
+  cleanup();
   setStatus('Connecting to signaling server...');
-  ws = new WebSocket(SIGNALING_URL);
+  const socket = new WebSocket(SIGNALING_URL);
+  ws = socket;
 
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room }));
+  socket.onopen = () => socket.send(JSON.stringify({ type: 'join', room }));
 
-  ws.onerror = () => setStatus('Could not reach signaling server. Check SIGNALING_URL / that server.js is running.');
+  socket.onerror = () => {
+    if (ws === socket) setStatus('Could not reach signaling server. Check SIGNALING_URL / that server.js is running.');
+  };
 
-  ws.onmessage = async (event) => {
+  socket.onmessage = async (event) => {
+    if (ws !== socket) return; // message from an old session, ignore
     const msg = JSON.parse(event.data);
 
     if (msg.type === 'joined') {
       isInitiator = msg.initiator;
-      setStatus(`In room. Waiting for the other PC to join...`);
+      setStatus('In room. Waiting for the other PC to join...');
     }
 
     if (msg.type === 'room-full') {
       setStatus('That room already has two peers. Try a different code.');
-      ws.close();
+      socket.close();
     }
 
     if (msg.type === 'ready') {
       setStatus('Peer found. Establishing direct connection...');
-      setupPeerConnection();
+      const conn = setupPeerConnection(socket);
       if (isInitiator) {
-        dataChannel = pc.createDataChannel('file-transfer');
+        dataChannel = conn.createDataChannel('file-transfer');
         setupDataChannel();
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+        const offer = await conn.createOffer();
+        await conn.setLocalDescription(offer);
+        if (ws === socket) socket.send(JSON.stringify({ type: 'offer', sdp: offer }));
       }
     }
 
-    if (msg.type === 'offer') {
-      await pc.setRemoteDescription(msg.sdp);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      ws.send(JSON.stringify({ type: 'answer', sdp: answer }));
+    if (msg.type === 'offer' && pc) {
+      const conn = pc;
+      await conn.setRemoteDescription(msg.sdp);
+      await flushCandidates(conn);
+      const answer = await conn.createAnswer();
+      await conn.setLocalDescription(answer);
+      if (ws === socket) socket.send(JSON.stringify({ type: 'answer', sdp: answer }));
     }
 
-    if (msg.type === 'answer') {
-      await pc.setRemoteDescription(msg.sdp);
+    if (msg.type === 'answer' && pc) {
+      const conn = pc;
+      await conn.setRemoteDescription(msg.sdp);
+      await flushCandidates(conn);
     }
 
     if (msg.type === 'ice-candidate') {
-      try { await pc.addIceCandidate(msg.candidate); } catch (e) { /* ignore */ }
+      // Candidates can arrive before the handshake is done: queue them until then.
+      if (pc && pc.remoteDescription) {
+        try { await pc.addIceCandidate(msg.candidate); } catch (e) { /* ignore */ }
+      } else {
+        pendingCandidates.push(msg.candidate);
+      }
     }
 
     if (msg.type === 'peer-left') {
-      setStatus('The other peer disconnected.');
-      dropEl.classList.add('disabled');
+      cleanup();
+      setStatus('The other peer disconnected. Click Connect to start a new session.');
     }
   };
 }
 
-function setupPeerConnection() {
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+function setupPeerConnection(socket) {
+  if (pc) { pc.onicecandidate = pc.onconnectionstatechange = pc.ondatachannel = null; try { pc.close(); } catch (e) {} }
+  const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  pc = conn;
 
-  pc.onicecandidate = (e) => {
-    if (e.candidate) ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
+  conn.onicecandidate = (e) => {
+    if (e.candidate && ws === socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
+    }
   };
 
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') {
+  conn.onconnectionstatechange = () => {
+    if (pc !== conn) return; // event from an old, replaced connection
+    const state = conn.connectionState;
+    if (state === 'connected') {
       setStatus('Connected directly to peer (P2P). Ready to send files.', true);
       dropEl.classList.remove('disabled');
-    }
-    if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+    } else if (state === 'disconnected') {
+      // Often temporary in WebRTC and can recover on its own.
+      setStatus('Connection unstable, trying to recover...');
+    } else if (state === 'failed' || state === 'closed') {
       setStatus('Connection lost.');
       dropEl.classList.add('disabled');
     }
   };
 
-  pc.ondatachannel = (e) => {
+  conn.ondatachannel = (e) => {
+    if (pc !== conn) return;
     dataChannel = e.channel;
     setupDataChannel();
   };
+
+  return conn;
 }
 
 function setupDataChannel() {

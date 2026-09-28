@@ -76,6 +76,8 @@
   </div>
 
   <div id="transfers"></div>
+
+  <div id="diag" style="margin-top:18px;font-size:11px;color:#9aa0aa;word-break:break-word;"></div>
 </div>
 
 <script>
@@ -122,6 +124,31 @@ $('joinBtn').onclick = () => {
 
 let pendingCandidates = [];
 
+// ---- Diagnostics (shown at the bottom of the page) ----
+const BUILD = 'v4-diag';
+const diagEl = $('diag');
+const candCounts = { host: 0, srflx: 0, relay: 0 };
+function renderDiag(extra) {
+  const parts = ['build ' + BUILD];
+  if (pc) parts.push('conn: ' + pc.connectionState, 'ice: ' + pc.iceConnectionState);
+  parts.push('candidates host/srflx/relay: ' + candCounts.host + '/' + candCounts.srflx + '/' + candCounts.relay);
+  if (extra) parts.push(extra);
+  diagEl.textContent = parts.join(' | ');
+}
+async function reportPath(conn) {
+  try {
+    const stats = await conn.getStats();
+    let pair;
+    stats.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId); });
+    if (!pair) stats.forEach(r => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) pair = r; });
+    if (pair) {
+      const l = stats.get(pair.localCandidateId), r = stats.get(pair.remoteCandidateId);
+      renderDiag('path: ' + (l && l.candidateType) + ' -> ' + (r && r.candidateType));
+    }
+  } catch (e) { /* ignore */ }
+}
+renderDiag();
+
 // Tear down everything from the previous session so nothing stale can
 // fire events into the next one.
 function cleanup() {
@@ -142,7 +169,9 @@ function cleanup() {
   }
   pendingCandidates = [];
   incomingFile = null;
+  candCounts.host = candCounts.srflx = candCounts.relay = 0;
   dropEl.classList.add('disabled');
+  renderDiag();
 }
 
 async function flushCandidates(conn) {
@@ -228,6 +257,11 @@ function setupPeerConnection(socket) {
   pc = conn;
 
   conn.onicecandidate = (e) => {
+    if (e.candidate) {
+      const m = / typ (\w+)/.exec(e.candidate.candidate || '');
+      if (m && m[1] in candCounts) candCounts[m[1]]++;
+      renderDiag();
+    }
     if (e.candidate && ws === socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
     }
@@ -236,7 +270,10 @@ function setupPeerConnection(socket) {
   conn.onconnectionstatechange = () => {
     if (pc !== conn) return; // event from an old, replaced connection
     const state = conn.connectionState;
+    console.log('connectionState:', state, 'iceConnectionState:', conn.iceConnectionState);
+    renderDiag();
     if (state === 'connected') {
+      reportPath(conn);
       setStatus('Connected directly to peer (P2P). Ready to send files.', true);
       dropEl.classList.remove('disabled');
     } else if (state === 'disconnected') {
@@ -247,6 +284,8 @@ function setupPeerConnection(socket) {
       dropEl.classList.add('disabled');
     }
   };
+
+  conn.oniceconnectionstatechange = () => { if (pc === conn) renderDiag(); };
 
   conn.ondatachannel = (e) => {
     if (pc !== conn) return;
